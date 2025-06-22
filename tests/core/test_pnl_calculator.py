@@ -127,6 +127,23 @@ class TestPnlCalculator(unittest.TestCase):
         pos7_stock_like = MockPosition(id=7, cost_basis=1000.0, status="CLOSED", closing_price=1200.0, legs=[])
         self.assertAlmostEqual(pnl_calculator.calculate_realized_pnl_for_position(pos7_stock_like), 200.0)
 
+        # Position CLOSED, leg-level, but one leg has closing_price_per_unit = 0.0 (e.g. worthless expiry)
+        leg_d_worthless = MockOptionLeg(id=104, entry_price_per_unit=0.5, quantity=1, closing_price_per_unit=0.0) # Bought for 0.5, closed at 0. PNL = (0-0.5)*1*100 = -50
+        pos8_worthless_leg = MockPosition(id=8, cost_basis=50.0, status="CLOSED", closing_price=None, legs=[leg_d_worthless])
+        self.assertAlmostEqual(pnl_calculator.calculate_realized_pnl_for_position(pos8_worthless_leg), -50.0)
+
+        # Position CLOSED, leg-level, mix of closed and open (no closing price) legs - this is unusual for a "CLOSED" position
+        # but tests robustness. calculate_realized_pnl_for_position should sum PNL for legs that DO have closing_price_per_unit.
+        leg_e_closed = MockOptionLeg(id=105, entry_price_per_unit=1.0, quantity=1, closing_price_per_unit=1.5) # PNL = 50
+        leg_f_no_close_price = MockOptionLeg(id=106, entry_price_per_unit=1.0, quantity=1, closing_price_per_unit=None)
+        pos9_mixed_legs = MockPosition(id=9, cost_basis=200.0, status="CLOSED", closing_price=None, legs=[leg_e_closed, leg_f_no_close_price])
+        self.assertAlmostEqual(pnl_calculator.calculate_realized_pnl_for_position(pos9_mixed_legs), 50.0,
+                             "Should sum PNL only from legs with closing_price_per_unit if position.closing_price is None")
+
+    def test_calculate_unrealized_pnl_for_leg_zero_quantity(self):
+        leg_zero_qty = MockOptionLeg(id=4, entry_price_per_unit=5.0, quantity=0, current_price_per_unit=7.5)
+        self.assertAlmostEqual(pnl_calculator.calculate_unrealized_pnl_for_leg(leg_zero_qty), 0.0)
+
 
 if __name__ == '__main__':
     unittest.main()
