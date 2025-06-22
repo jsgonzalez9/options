@@ -1,12 +1,14 @@
 from sqlalchemy.orm import Session, joinedload
-from sqlalchemy.orm import Session, joinedload
 from . import models
 from . import setup # For SessionLocal and engine if needed directly, though session is passed
 from typing import List, Dict, Any, Optional
 import datetime
-from src.core.spread_validator import validate_spread_legs # Moved import to top
+from src.core.spread_validator import validate_spread_legs
+from src.core import pnl_calculator # For P&L calculations
+from src.api.alpha_vantage import AlphaVantageAPI # For type hinting PriceFetcher
 
 # Multiplier for option contracts (typically 100 shares per contract)
+# This is also defined in pnl_calculator.py. Should be centralized if possible.
 OPTION_MULTIPLIER = 100
 
 def create_db_tables():
@@ -54,7 +56,9 @@ def create_position(db: Session, spread_type: str, legs_data: List[Dict[str, Any
         cost_basis=cost_basis,
         status=status,
         notes=notes,
-        entry_date=entry_date if entry_date else datetime.datetime.utcnow()
+        entry_date=entry_date if entry_date else datetime.datetime.utcnow(),
+        unrealized_pnl=0.0, # Initial P&L is zero
+        realized_pnl=0.0
     )
     db.add(db_position)
     # Flush to get db_position.id for foreign key in legs, if not using backref population before commit.
@@ -62,8 +66,6 @@ def create_position(db: Session, spread_type: str, legs_data: List[Dict[str, Any
     # db.flush()
 
     # Validate spread type before creating legs
-    # This import should ideally be at the top of the file
-    from src.core.spread_validator import validate_spread_legs
     is_valid, validation_message = validate_spread_legs(spread_type, legs_data)
     if not is_valid:
         # If validation fails, we should not proceed. Rollback any session changes (like adding db_position).
@@ -109,15 +111,30 @@ def update_position_status(db: Session, position_id: int, new_status: str,
     """Updates the status of a position. If closing, closing_price can be provided."""
     db_position = get_position_by_id(db, position_id)
     if db_position:
-        db_position.status = new_status.upper()
-        if new_status.upper() == "CLOSED" and closing_price is not None:
-            db_position.closing_price = closing_price
-            # Optionally, update all leg closing prices if not done individually
-            # for leg in db_position.legs:
-            #     if leg.closing_price_per_unit is None: # Only if not already set
-            #         # This is tricky without knowing individual leg closing prices
-            #         # Placeholder for more complex logic if needed
-            #         pass
+        original_status = db_position.status
+        new_status_upper = new_status.upper()
+        db_position.status = new_status_upper
+
+        if new_status_upper == "CLOSED":
+            if closing_price is not None:
+                db_position.closing_price = closing_price
+
+            # Calculate and store realized P&L
+            # This assumes that if individual leg closing prices are needed, they are already set on the legs.
+            db_position.realized_pnl = pnl_calculator.calculate_realized_pnl_for_position(db_position)
+            db_position.unrealized_pnl = 0.0 # No unrealized P&L once closed
+
+            # Optionally, if position.closing_price was just set, and we want to ensure leg P&Ls are
+            # consistent or legs are marked as closed, this would be the place.
+            # For now, calculate_realized_pnl_for_position prefers position.closing_price if available.
+
+        elif original_status == "CLOSED" and new_status_upper != "CLOSED": # E.g. Reopening a position
+            db_position.realized_pnl = 0.0 # Clear realized P&L
+            db_position.closing_price = None # Clear overall closing price
+            # Unrealized P&L would need recalculation based on current market prices.
+            # This might be handled by a subsequent call to update_legs_current_prices_and_unrealized_pnl.
+            # For now, don't change unrealized_pnl here, let the dedicated function handle it.
+
         # db.commit() # COMMIT IS HANDLED BY CALLER
         db.flush()
         db.refresh(db_position)
@@ -141,21 +158,13 @@ def add_legs_to_position(db: Session, position_id: int, new_legs_data: List[Dict
         db.add(db_leg)
         # db_position.legs.append(db_leg) # Append to relationship if preferred
 
-    # Recalculate cost basis: get all current legs data + new legs data
-    # This is simpler: fetch all legs from DB after new ones are flushed (or before commit)
-    # For now, we assume cost_basis is additive or needs more complex adjustment logic
-    # For simplicity, let's assume the existing cost_basis is correct for existing legs,
-    # and we add the cost of new legs.
-
     new_legs_cost = calculate_position_cost_basis(new_legs_data)
     db_position.cost_basis += new_legs_cost # Add cost of new legs
 
     # db.commit() # COMMIT IS HANDLED BY CALLER
     db.flush()
     db.refresh(db_position)
-    # Eager load legs again after refresh might require re-querying if session state is complex
-    # For now, assume refresh is sufficient or caller requeries.
-    return db_position # Return the instance that should be in the session
+    return db_position
 
 
 def update_leg_current_price(db: Session, leg_id: int, new_price: float) -> Optional[models.OptionLeg]:
@@ -173,7 +182,6 @@ def update_leg_closing_price(db: Session, leg_id: int, closing_price: float) -> 
     db_leg = db.query(models.OptionLeg).filter(models.OptionLeg.id == leg_id).first()
     if db_leg:
         db_leg.closing_price_per_unit = closing_price
-        # Potentially update parent position status or P&L here or in a service layer
         # db.commit() # COMMIT IS HANDLED BY CALLER
         db.flush()
         db.refresh(db_leg)
@@ -182,7 +190,7 @@ def update_leg_closing_price(db: Session, leg_id: int, closing_price: float) -> 
 
 def add_note_to_position(db: Session, position_id: int, note_text: str, append: bool = True) -> Optional[models.Position]:
     """Adds or appends a note to a position."""
-    db_position = get_position_by_id(db, position_id) # This uses joinedload, good.
+    db_position = get_position_by_id(db, position_id)
     if db_position:
         if append and db_position.notes:
             db_position.notes += f"\n---\n{datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}\n{note_text}"
@@ -195,33 +203,67 @@ def add_note_to_position(db: Session, position_id: int, note_text: str, append: 
 
 def delete_position(db: Session, position_id: int) -> bool:
     """Deletes a position and its associated legs (due to cascade). Hard delete."""
-    db_position = get_position_by_id(db, position_id) # Uses joinedload
+    db_position = get_position_by_id(db, position_id)
     if db_position:
         db.delete(db_position)
         # db.commit() # COMMIT IS HANDLED BY CALLER
-        db.flush() # Make sure delete operation is sent to DB if other operations follow before commit
+        db.flush()
         return True
     return False
+
+def update_legs_current_prices_and_unrealized_pnl(
+    db: Session,
+    position_id: int,
+    leg_current_prices: Dict[int, float],
+    # price_fetcher: Optional[AlphaVantageAPI] = None # Placeholder for future use
+) -> Optional[models.Position]:
+    """
+    Updates the current_price_per_unit for specified legs of a position
+    and then recalculates and updates the position's total unrealized P&L.
+
+    Args:
+        db: The SQLAlchemy session.
+        position_id: The ID of the position to update.
+        leg_current_prices: A dictionary mapping leg_id to its new current_market_price_per_unit.
+                           Example: {101: 2.50, 102: 1.80}
+
+    Returns:
+        The updated Position object or None if not found.
+    """
+    db_position = get_position_by_id(db, position_id) # This already eager loads legs
+    if not db_position:
+        return None
+
+    if db_position.status == "CLOSED":
+        db_position.unrealized_pnl = 0.0 # Closed positions have no unrealized P&L
+        db.flush()
+        # db.refresh(db_position) # Refresh might not be needed if only UPL is changed and it's the last op
+        return db_position
+
+    total_unrealized_pnl_for_position = 0.0
+    # legs_updated_count = 0 # Not used currently
+
+    for leg in db_position.legs:
+        # Update leg's current price if provided in the input dictionary
+        if leg.id in leg_current_prices:
+            leg.current_price_per_unit = leg_current_prices[leg.id]
+            # legs_updated_count += 1
+
+        leg_pnl = pnl_calculator.calculate_unrealized_pnl_for_leg(leg)
+        total_unrealized_pnl_for_position += leg_pnl
+
+    db_position.unrealized_pnl = total_unrealized_pnl_for_position
+
+    db.flush()
+    # db.refresh(db_position) # Refresh to ensure the session object has the latest state from DB if needed by caller
+                           # For this function, returning the modified db_position should be fine.
+    return db_position
 
 
 # --- Example Usage (for testing or direct script execution) ---
 if __name__ == '__main__':
     print("Running CRUD example...")
-    # Create tables if they don't exist (using a local test DB)
-    # This should point to the same DB used by models.py if run together, or a dedicated test DB.
-    # For consistency with models.py __main__, let's use a similar DB or in-memory.
-    # import os
-    # db_file = "trading_journal_crud_test.db"
-    # if os.path.exists(db_file):
-    #     os.remove(db_file)
-    # setup.DATABASE_URL = f"sqlite:///./{db_file}" # Override for this test run
-
-    # Re-create engine if DATABASE_URL was changed in setup
-    # setup.engine = setup.create_engine(setup.DATABASE_URL, connect_args={"check_same_thread": False})
-    # setup.SessionLocal = setup.sessionmaker(autocommit=False, autoflush=False, bind=setup.engine)
-
-    # Use the setup module's engine and session
-    create_db_tables() # Creates tables based on setup.DATABASE_URL
+    create_db_tables()
 
     db_session_gen = setup.get_db_session()
     db = next(db_session_gen)
@@ -229,40 +271,57 @@ if __name__ == '__main__':
     try:
         print("\n1. Creating a new Bull Call Spread position...")
         bull_call_legs_data = [
-            {"option_type": "CALL", "strike_price": 200.0, "expiry_date": datetime.date(2025, 3, 21), "quantity": 1, "entry_price_per_unit": 5.50},
-            {"option_type": "CALL", "strike_price": 210.0, "expiry_date": datetime.date(2025, 3, 21), "quantity": -1, "entry_price_per_unit": 2.50}
+            {"option_type": "CALL", "strike_price": 200.0, "expiry_date": datetime.date(2025, 3, 21), "quantity": 1, "entry_price_per_unit": 5.50}, # Leg A
+            {"option_type": "CALL", "strike_price": 210.0, "expiry_date": datetime.date(2025, 3, 21), "quantity": -1, "entry_price_per_unit": 2.50} # Leg B
         ]
-        # Expected cost_basis: (1 * 5.50 - 1 * 2.50) * 100 = 3.00 * 100 = 300.0
         position1 = create_position(db, "Bull Call Spread", bull_call_legs_data, notes="SPY Bull Call")
-        print(f"Created position: {position1} with ID {position1.id}, Cost Basis: {position1.cost_basis}")
-        for leg in position1.legs:
-            print(f"  Leg: {leg}")
+        db.commit()
+        print(f"Created position: {position1} with ID {position1.id}, Cost Basis: {position1.cost_basis}, UPL: {position1.unrealized_pnl}")
+        leg_ids_pos1 = {leg.strike_price: leg.id for leg in position1.legs}
+
+        print("\n1a. Update current prices and unrealized P&L for position 1")
+        # Leg A (long 200C): Entry 5.50. Current 6.00. PNL = (6.00 - 5.50) * 1 * 100 = 50
+        # Leg B (short 210C): Entry 2.50. Current 3.00. PNL = (2.50 - 3.00) * 1 * 100 = -50 (Note: pnl_calculator uses (market-entry)*qty)
+        # So for Leg B: (3.00 - 2.50) * -1 * 100 = 0.50 * -1 * 100 = -50
+        # Total Unrealized P&L = 50 - 50 = 0
+        prices_pos1 = {
+            leg_ids_pos1[200.0]: 6.00, # Leg A current price
+            leg_ids_pos1[210.0]: 3.00  # Leg B current price
+        }
+        position1_updated_pnl = update_legs_current_prices_and_unrealized_pnl(db, position1.id, prices_pos1)
+        db.commit()
+        print(f"Position 1 after P&L update: ID {position1_updated_pnl.id}, Unrealized P&L: {position1_updated_pnl.unrealized_pnl:.2f}")
+
 
         print("\n2. Creating an Iron Condor position...")
         iron_condor_legs = [
-            {"option_type": "PUT", "strike_price": 180.0, "expiry_date": datetime.date(2025, 3, 21), "quantity": 1, "entry_price_per_unit": 1.50}, # Buy Put
-            {"option_type": "PUT", "strike_price": 190.0, "expiry_date": datetime.date(2025, 3, 21), "quantity": -1, "entry_price_per_unit": 3.50},# Sell Put
-            {"option_type": "CALL", "strike_price": 220.0, "expiry_date": datetime.date(2025, 3, 21), "quantity": -1, "entry_price_per_unit": 3.00},# Sell Call
-            {"option_type": "CALL", "strike_price": 230.0, "expiry_date": datetime.date(2025, 3, 21), "quantity": 1, "entry_price_per_unit": 1.00}  # Buy Call
+            {"option_type": "PUT", "strike_price": 180.0, "expiry_date": datetime.date(2025, 3, 21), "quantity": 1, "entry_price_per_unit": 1.50},
+            {"option_type": "PUT", "strike_price": 190.0, "expiry_date": datetime.date(2025, 3, 21), "quantity": -1, "entry_price_per_unit": 3.50},
+            {"option_type": "CALL", "strike_price": 220.0, "expiry_date": datetime.date(2025, 3, 21), "quantity": -1, "entry_price_per_unit": 3.00},
+            {"option_type": "CALL", "strike_price": 230.0, "expiry_date": datetime.date(2025, 3, 21), "quantity": 1, "entry_price_per_unit": 1.00}
         ]
-        # Expected cost_basis: (1.50 (debit) - 3.50 (credit) - 3.00 (credit) + 1.00 (debit)) * 100
-        # = (2.50 - 6.50) * 100 = -4.00 * 100 = -400.0 (Net Credit)
-        position2 = create_position(db, "Iron Condor", iron_condor_legs, notes="SPY Iron Condor, expecting credit")
-        print(f"Created position: {position2} with ID {position2.id}, Cost Basis: {position2.cost_basis}")
+        position2 = create_position(db, "Iron Condor", iron_condor_legs, notes="SPY Iron Condor")
+        db.commit()
+        print(f"Created position: {position2} with ID {position2.id}, Cost Basis: {position2.cost_basis}, UPL: {position2.unrealized_pnl}")
 
         print("\n3. Retrieving all OPEN positions:")
         all_open_positions = get_all_positions(db, status="OPEN")
         for pos in all_open_positions:
-            print(f"  Found: {pos}, Legs: {len(pos.legs)}")
+            print(f"  Found: {pos}, Legs: {len(pos.legs)}, UPL: {pos.unrealized_pnl:.2f}, RPL: {pos.realized_pnl:.2f}")
 
         print(f"\n4. Updating status of position {position1.id} to CLOSED...")
-        updated_pos1 = update_position_status(db, position1.id, "CLOSED", closing_price=350.0) # Closed for a $350 credit
-        print(f"Updated position: {updated_pos1}")
+        # Position 1 CB = 300.0. Closed for net $350 credit. RPL = 350 - 300 = 50.
+        updated_pos1 = update_position_status(db, position1.id, "CLOSED", closing_price=350.0)
+        db.commit()
+        print(f"Updated position: {updated_pos1}, Status: {updated_pos1.status}, Realized P&L: {updated_pos1.realized_pnl:.2f}, Unrealized P&L: {updated_pos1.unrealized_pnl:.2f}")
 
         print(f"\n5. Adding a note to position {position2.id}...")
+        # ... (rest of example script remains largely the same) ...
         pos_with_note = add_note_to_position(db, position2.id, "Market moved, considering adjustment.")
+        db.commit()
         print(f"Position with note: {pos_with_note.notes}")
         pos_with_note = add_note_to_position(db, position2.id, "Decided to hold.")
+        db.commit()
         print(f"Position with appended note: \n{pos_with_note.notes}")
 
 
@@ -270,6 +329,7 @@ if __name__ == '__main__':
             first_leg_id = position2.legs[0].id
             print(f"\n6. Updating current price for leg {first_leg_id} of position {position2.id}...")
             updated_leg = update_leg_current_price(db, first_leg_id, 1.80)
+            db.commit()
             print(f"Updated leg: {updated_leg}, Current Price: {updated_leg.current_price_per_unit}")
 
         print("\n7. Retrieving position by ID (position2):")
@@ -280,23 +340,14 @@ if __name__ == '__main__':
                 print(f"  Leg: {leg.option_type} {leg.strike_price}, Qty: {leg.quantity}, Entry: {leg.entry_price_per_unit}, Current: {leg.current_price_per_unit}")
 
         print(f"\n8. Adding new legs to position {position2.id} (e.g. rolling one side - conceptual)")
-        # This is a simplified roll; actual rolling involves closing old and opening new.
-        # Here, just adding more legs for testing 'add_legs_to_position'
         new_legs_for_pos2 = [
              {"option_type": "PUT", "strike_price": 170.0, "expiry_date": datetime.date(2025, 4, 18), "quantity": 1, "entry_price_per_unit": 0.80},
              {"option_type": "PUT", "strike_price": 180.0, "expiry_date": datetime.date(2025, 4, 18), "quantity": -1, "entry_price_per_unit": 2.00}
         ]
-        # Cost of new legs: (0.80 - 2.00) * 100 = -1.20 * 100 = -120 (credit)
-        # Original cost_basis for pos2: -400. New cost_basis = -400 - 120 = -520
         pos2_with_added_legs = add_legs_to_position(db, position2.id, new_legs_for_pos2)
+        db.commit()
         if pos2_with_added_legs:
             print(f"Position {pos2_with_added_legs.id} after adding legs. New CB: {pos2_with_added_legs.cost_basis}. Total legs: {len(pos2_with_added_legs.legs)}")
-
-
-        # print(f"\n9. Deleting position {position1.id}...")
-        # delete_success = delete_position(db, position1.id)
-        # print(f"Deletion successful: {delete_success}")
-        # self.assertIsNone(crud.get_position_by_id(db, self.position1.id))
 
 
     except Exception as e:

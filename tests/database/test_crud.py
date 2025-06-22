@@ -140,6 +140,29 @@ class TestCrudOperations(unittest.TestCase):
         self.assertIsNotNone(updated_pos)
         self.assertEqual(updated_pos.status, "CLOSED")
         self.assertEqual(updated_pos.closing_price, 150.0)
+        # Assuming pos CB was 100 (1*1.0*100). RPL = 150 - 100 = 50
+        self.assertAlmostEqual(updated_pos.realized_pnl, 50.0)
+        self.assertAlmostEqual(updated_pos.unrealized_pnl, 0.0)
+
+    def test_reopen_position_clears_realized_pnl(self):
+        pos_data = [{"option_type":"CALL", "strike_price":100, "expiry_date":datetime.date(2025,1,1), "quantity":1, "entry_price_per_unit":1.0}]
+        pos = crud.create_position(self.db, "Test Reopen", pos_data)
+        self.db.commit()
+
+        # Close position
+        closed_pos = crud.update_position_status(self.db, pos.id, "CLOSED", closing_price=120.0) # RPL = 120-100=20
+        self.db.commit()
+        self.assertAlmostEqual(closed_pos.realized_pnl, 20.0)
+        self.assertEqual(closed_pos.closing_price, 120.0)
+
+        # Reopen position
+        reopened_pos = crud.update_position_status(self.db, pos.id, "OPEN")
+        self.db.commit()
+        self.assertIsNotNone(reopened_pos)
+        self.assertEqual(reopened_pos.status, "OPEN")
+        self.assertAlmostEqual(reopened_pos.realized_pnl, 0.0) # Should be cleared
+        self.assertIsNone(reopened_pos.closing_price) # Should be cleared
+        # Unrealized P&L would need explicit recalculation.
 
     def test_add_legs_to_position(self):
         pos = crud.create_position(self.db, "Test Add Legs", [{"option_type":"CALL", "strike_price":100, "expiry_date":datetime.date(2025,1,1), "quantity":1, "entry_price_per_unit":1.0}]) # CB = 100
@@ -216,6 +239,73 @@ class TestCrudOperations(unittest.TestCase):
 
         delete_fail = crud.delete_position(self.db, 99999) # Non-existent ID
         self.assertFalse(delete_fail)
+
+    def test_update_legs_current_prices_and_unrealized_pnl(self):
+        legs_data: List[Dict[str, Any]] = [
+            {"option_type": "CALL", "strike_price": 100.0, "expiry_date": datetime.date(2025,1,17), "quantity": 1, "entry_price_per_unit": 2.00}, # Leg 1
+            {"option_type": "CALL", "strike_price": 105.0, "expiry_date": datetime.date(2025,1,17), "quantity": -1, "entry_price_per_unit": 1.00} # Leg 2
+        ]
+        # Position CB = (2.00 * 1 - 1.00 * 1) * 100 = 100.0
+        pos = crud.create_position(self.db, "Test UPL Update", legs_data)
+        self.db.commit()
+
+        leg1_id = None
+        leg2_id = None
+        for leg in pos.legs:
+            if leg.strike_price == 100.0: leg1_id = leg.id
+            if leg.strike_price == 105.0: leg2_id = leg.id
+
+        self.assertIsNotNone(leg1_id)
+        self.assertIsNotNone(leg2_id)
+
+        # Initial UPL should be 0 (or based on initial current_price_per_unit if set, which is None here)
+        self.assertAlmostEqual(pos.unrealized_pnl, 0.0)
+
+        # Update prices:
+        # Leg 1 (long 100C): Entry 2.00, New Current 2.50 -> PNL = (2.50 - 2.00) * 1 * 100 = 50.0
+        # Leg 2 (short 105C): Entry 1.00, New Current 0.80 -> PNL = (0.80 - 1.00) * -1 * 100 = 20.0
+        # Total UPL = 50.0 + 20.0 = 70.0
+        leg_current_prices = {
+            leg1_id: 2.50,
+            leg2_id: 0.80
+        }
+        updated_pos = crud.update_legs_current_prices_and_unrealized_pnl(self.db, pos.id, leg_current_prices)
+        self.db.commit() # Commit the changes made by the UPL update function
+
+        self.assertIsNotNone(updated_pos)
+        self.assertAlmostEqual(updated_pos.unrealized_pnl, 70.0)
+
+        # Verify individual leg current prices were updated
+        self.db.refresh(updated_pos) # Ensure legs are refreshed
+        for leg in updated_pos.legs:
+            if leg.id == leg1_id:
+                self.assertAlmostEqual(leg.current_price_per_unit, 2.50)
+            if leg.id == leg2_id:
+                self.assertAlmostEqual(leg.current_price_per_unit, 0.80)
+
+    def test_update_unrealized_pnl_for_closed_position(self):
+        legs_data: List[Dict[str, Any]] = [
+            {"option_type": "CALL", "strike_price": 100.0, "expiry_date": datetime.date(2025,1,17), "quantity": 1, "entry_price_per_unit": 2.00},
+        ]
+        pos = crud.create_position(self.db, "Test UPL Closed", legs_data)
+        self.db.commit()
+
+        # Close the position
+        crud.update_position_status(self.db, pos.id, "CLOSED", closing_price=250.0) # RPL = 250 - 200 = 50
+        self.db.commit()
+
+        # Attempt to update UPL for the now closed position
+        leg_id = pos.legs[0].id
+        leg_current_prices = {leg_id: 3.00} # Arbitrary current price
+
+        updated_pos = crud.update_legs_current_prices_and_unrealized_pnl(self.db, pos.id, leg_current_prices)
+        self.db.commit()
+
+        self.assertIsNotNone(updated_pos)
+        self.assertEqual(updated_pos.status, "CLOSED")
+        self.assertAlmostEqual(updated_pos.unrealized_pnl, 0.0) # Should be 0 for closed positions
+        self.assertAlmostEqual(updated_pos.realized_pnl, 50.0) # Should remain unchanged
+
 
 if __name__ == '__main__':
     unittest.main()

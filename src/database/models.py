@@ -17,6 +17,10 @@ class Position(Base):
     closing_price = Column(Float, nullable=True) # Net price when position is closed
     notes = Column(Text, nullable=True)
 
+    # P&L fields
+    unrealized_pnl = Column(Float, nullable=True, default=0.0)
+    realized_pnl = Column(Float, nullable=True, default=0.0)
+
     # Relationship to OptionLeg: A position can have multiple legs
     legs = relationship("OptionLeg", back_populates="position", cascade="all, delete-orphan")
 
