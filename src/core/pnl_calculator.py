@@ -4,7 +4,7 @@ from typing import Optional
 # Multiplier for option contracts (typically 100 shares per contract)
 # This should ideally be configurable or passed in if it can vary.
 # For now, using a global constant consistent with crud.py.
-OPTION_MULTIPLIER = 100
+from src.config import OPTION_MULTIPLIER # Centralized configuration
 
 def calculate_leg_pnl(
     leg_entry_price: float,

@@ -6,10 +6,7 @@ import datetime
 from src.core.spread_validator import validate_spread_legs
 from src.core import pnl_calculator # For P&L calculations
 from src.api.alpha_vantage import AlphaVantageAPI # For type hinting PriceFetcher
-
-# Multiplier for option contracts (typically 100 shares per contract)
-# This is also defined in pnl_calculator.py. Should be centralized if possible.
-OPTION_MULTIPLIER = 100
+from src.config import OPTION_MULTIPLIER # Centralized configuration
 
 def create_db_tables():
     """Utility function to create tables. Delegates to setup.py or can be called directly."""
