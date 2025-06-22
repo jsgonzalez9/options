@@ -69,8 +69,12 @@ def create_new_position(position_in: PositionCreate, db: Session = Depends(db_se
         legs_data_dicts = [leg.model_dump(mode='python') for leg in position_in.legs_data]
 
         created_position = crud.create_position(
-            db=db, spread_type=position_in.spread_type, legs_data=legs_data_dicts,
-            status=position_in.status, notes=position_in.notes
+            db=db,
+            underlying_symbol=position_in.underlying_symbol, # Pass underlying_symbol
+            spread_type=position_in.spread_type,
+            legs_data=legs_data_dicts,
+            status=position_in.status,
+            notes=position_in.notes
         )
         db.commit()
         # Refresh is crucial to get DB-generated IDs and relationships correctly loaded

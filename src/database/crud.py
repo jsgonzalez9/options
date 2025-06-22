@@ -32,7 +32,8 @@ def calculate_position_cost_basis(legs_data: List[Dict[str, Any]]) -> float:
 
 def create_position(db: Session, spread_type: str, legs_data: List[Dict[str, Any]],
                     status: str = "OPEN", notes: Optional[str] = None,
-                    entry_date: Optional[datetime.datetime] = None) -> models.Position:
+                    entry_date: Optional[datetime.datetime] = None,
+                    underlying_symbol: Optional[str] = None) -> models.Position: # Added underlying_symbol
     """
     Creates a new position and its associated option legs.
     legs_data is a list of dictionaries, each representing an OptionLeg.
@@ -49,6 +50,7 @@ def create_position(db: Session, spread_type: str, legs_data: List[Dict[str, Any
     cost_basis = calculate_position_cost_basis(legs_data)
 
     db_position = models.Position(
+        underlying_symbol=underlying_symbol, # Save underlying_symbol
         spread_type=spread_type,
         cost_basis=cost_basis,
         status=status,

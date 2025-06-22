@@ -28,6 +28,7 @@ class OptionLegDisplay(OptionLegBase):
 # --- Position Schemas ---
 
 class PositionBase(BaseModel):
+    underlying_symbol: Optional[str] = None # NEW FIELD
     spread_type: str
     status: str = Field(default="OPEN", pattern="^(OPEN|CLOSED|ROLLED|EXPIRED)$")
     notes: Optional[str] = None

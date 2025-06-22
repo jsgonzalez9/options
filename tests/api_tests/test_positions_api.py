@@ -62,9 +62,10 @@ class TestPositionsAPI(unittest.TestCase):
         finally:
             db.close()
 
-    def _create_bull_call_spread_payload(self) -> dict:
+    def _create_bull_call_spread_payload(self, underlying_symbol="TESTXYZ", spread_type_override=None) -> dict:
         return {
-            "spread_type": "Bull Call Spread",
+            "underlying_symbol": underlying_symbol,
+            "spread_type": spread_type_override if spread_type_override else "Bull Call Spread", # Use specific type
             "status": "OPEN",
             "legs_data": [
                 {"option_type": "CALL", "strike_price": 100.0, "expiry_date": (datetime.date.today() + datetime.timedelta(days=30)).isoformat(), "quantity": 1, "entry_price_per_unit": 2.00},
@@ -85,7 +86,8 @@ class TestPositionsAPI(unittest.TestCase):
 
 
     def test_create_position_invalid_spread(self):
-        payload = self._create_bull_call_spread_payload()
+        # Ensure we use a spread_type that has a validator, like "Bull Call Spread"
+        payload = self._create_bull_call_spread_payload(underlying_symbol="INVALIDTEST", spread_type_override="Bull Call Spread")
         payload["legs_data"].pop() # Make it invalid (only 1 leg for BCS)
         response = self.client.post("/api/v1/positions/", json=payload)
         self.assertEqual(response.status_code, 400) # Validation error from spread_validator
@@ -93,10 +95,10 @@ class TestPositionsAPI(unittest.TestCase):
 
     def test_list_positions(self):
         # Create a couple of positions
-        self.client.post("/api/v1/positions/", json=self._create_bull_call_spread_payload())
-        payload2 = self._create_bull_call_spread_payload()
-        payload2["spread_type"] = "Another BCS"
-        self.client.post("/api/v1/positions/", json=payload2)
+        self.client.post("/api/v1/positions/", json=self._create_bull_call_spread_payload(underlying_symbol="POS1"))
+        # To ensure different spread_type for listing, override it or use a different helper if available
+        self.client.post("/api/v1/positions/", json=self._create_bull_call_spread_payload(underlying_symbol="POS2", spread_type_override="Custom Spread For List"))
+
 
         response = self.client.get("/api/v1/positions/")
         self.assertEqual(response.status_code, 200)
@@ -116,18 +118,15 @@ class TestPositionsAPI(unittest.TestCase):
     @patch('src.core.derivatives_calculator.AlphaVantageAPI.get_stock_quote') # Mock the external API call
     def test_get_specific_position_with_delta(self, mock_get_quote):
         # Mock the return value of AlphaVantageAPI.get_stock_quote
-        # The symbol inferred by calculate_position_delta is "Bull" from "Bull Call Spread"
-        # This highlights the fragility of the current symbol inference.
-        # For this test to pass, we must ensure our mock matches this inferred symbol.
-        # A better solution is to store underlying_symbol with position/leg.
-        mock_get_quote.return_value = {"05. price": "102.00"} # Underlying price for "Bull"
+        # The symbol will now be taken from position.underlying_symbol
+        test_symbol = "TESTDELTA"
+        mock_get_quote.return_value = {"05. price": "102.00"} # Underlying price for test_symbol
 
-        payload = self._create_bull_call_spread_payload()
-        payload["spread_type"] = "XYZ Bull Call Spread" # Make symbol a bit more explicit for mocking
-        mock_get_quote.return_value = {"05. price": "102.00"} # Underlying price for "XYZ"
+        payload = self._create_bull_call_spread_payload(underlying_symbol=test_symbol)
+        # payload["spread_type"] will be f"{test_symbol} Bull Call Spread"
 
         create_response = self.client.post("/api/v1/positions/", json=payload)
-        self.assertEqual(create_response.status_code, 201)
+        self.assertEqual(create_response.status_code, 201, create_response.json())
         position_id = create_response.json()["id"]
 
         # Get position with delta calculation
@@ -146,8 +145,8 @@ class TestPositionsAPI(unittest.TestCase):
         self.assertTrue(abs(data["calculated_position_delta"] - expected_delta) < 0.01,
                         f"Delta {data['calculated_position_delta']:.4f} not close to expected {expected_delta:.4f}")
 
-        # Ensure the mock was called with the inferred symbol "XYZ"
-        mock_get_quote.assert_called_once_with("XYZ")
+        # Ensure the mock was called with the correct symbol from the position
+        mock_get_quote.assert_called_once_with(test_symbol)
 
 
     def test_update_position_status_to_closed(self):

@@ -112,29 +112,39 @@ def calculate_position_delta(
     # The caller of this function should provide the symbol or it should be on Position model.
     # Let's say we try to infer it from spread_type, e.g. "AAPL Bull Call" -> "AAPL"
     # This is a placeholder for a better symbol resolution mechanism.
-    inferred_symbol = position.spread_type.split(" ")[0] if position.spread_type else None # Very naive
+    #inferred_symbol = position.spread_type.split(" ")[0] if position.spread_type else None # Very naive
 
-    if not inferred_symbol and not underlying_prices_override:
+    symbol_to_fetch = position.underlying_symbol
+    if not symbol_to_fetch: # Fallback if underlying_symbol is not set
+        symbol_to_fetch = position.spread_type.split(" ")[0] if position.spread_type else None
+        if symbol_to_fetch:
+            print(f"Warning: Position {position.id} missing 'underlying_symbol'. Inferred '{symbol_to_fetch}' from spread_type for delta calculation.")
+        else:
+            print(f"Warning: Could not determine underlying symbol for position {position.id} (missing 'underlying_symbol' and cannot infer from spread_type). Cannot calculate delta.")
+            return 0.0
+
+
+    if not symbol_to_fetch and not underlying_prices_override:
         # Cannot proceed without a symbol to fetch prices or an override.
         # In a real API, the symbol might come from the Position model or be a parameter.
-        print(f"Warning: Could not determine underlying symbol for position {position.id} to calculate delta.")
+        print(f"Warning: No symbol available for position {position.id} to calculate delta.")
         return 0.0 # Or raise error
 
     current_underlying_price = None
-    if underlying_prices_override and inferred_symbol in underlying_prices_override:
-        current_underlying_price = underlying_prices_override[inferred_symbol]
-    elif inferred_symbol:
+    if underlying_prices_override and symbol_to_fetch in underlying_prices_override:
+        current_underlying_price = underlying_prices_override[symbol_to_fetch]
+    elif symbol_to_fetch:
         try:
             # This is a live API call. Consider caching or rate limits.
-            quote = price_fetcher.get_stock_quote(inferred_symbol)
+            quote = price_fetcher.get_stock_quote(symbol_to_fetch)
             current_underlying_price = float(quote["05. price"])
         except Exception as e:
-            print(f"Could not fetch live price for {inferred_symbol} for delta calc: {e}")
+            print(f"Could not fetch live price for {symbol_to_fetch} for delta calc: {e}")
             # Fallback or error. For now, can't calculate delta accurately.
             return 0.0 # Or raise an error indicating price fetch failure.
 
     if current_underlying_price is None:
-        print(f"Failed to obtain underlying price for {inferred_symbol} for position {position.id}.")
+        print(f"Failed to obtain underlying price for {symbol_to_fetch} for position {position.id}.")
         return 0.0
 
     # Use provided overrides or defaults for vol and rfr

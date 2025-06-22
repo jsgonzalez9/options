@@ -9,9 +9,10 @@ class Position(Base):
     __tablename__ = "positions"
 
     id = Column(Integer, primary_key=True, index=True)
-    spread_type = Column(String, index=True, nullable=False) # E.g., "Bull Call Spread", "Iron Condor", "Stock"
-    entry_date = Column(DateTime, default=datetime.datetime.utcnow)
-    status = Column(String, default="OPEN", index=True) # E.g., "OPEN", "CLOSED", "ROLLED", "EXPIRED"
+    underlying_symbol = Column(String, nullable=True, index=True) # NEW FIELD
+    spread_type = Column(String, index=True, nullable=False) # Already indexed
+    entry_date = Column(DateTime, default=datetime.datetime.utcnow, index=True) # Add index
+    status = Column(String, default="OPEN", index=True) # Already indexed
     # cost_basis is the net cost to open the position. Positive if debit, negative if credit.
     cost_basis = Column(Float, nullable=False, default=0.0)
     closing_price = Column(Float, nullable=True) # Net price when position is closed
@@ -32,11 +33,11 @@ class OptionLeg(Base):
     __tablename__ = "option_legs"
 
     id = Column(Integer, primary_key=True, index=True)
-    position_id = Column(Integer, ForeignKey("positions.id"), nullable=False)
+    position_id = Column(Integer, ForeignKey("positions.id"), nullable=False, index=True) # Add index (FKs often auto-indexed but explicit is fine)
 
     option_type = Column(String, nullable=False)  # "CALL" or "PUT"
     strike_price = Column(Float, nullable=False)
-    expiry_date = Column(Date, nullable=False)
+    expiry_date = Column(Date, nullable=False, index=True) # Add index
 
     # Quantity: positive for long (bought), negative for short (sold)
     quantity = Column(Integer, nullable=False)
