@@ -61,6 +61,16 @@ class OptionLeg(Base):
                 f"EntryPrc: {self.entry_price_per_unit:.2f})>")
 
 
+class PortfolioSetting(Base):
+    __tablename__ = "portfolio_settings"
+
+    key = Column(String, primary_key=True, index=True) # e.g., "cash_balance"
+    value = Column(Float, nullable=False)
+
+    def __repr__(self):
+        return f"<PortfolioSetting(key='{self.key}', value={self.value})>"
+
+
 if __name__ == '__main__':
     # This section is for basic testing or direct execution of this file.
     # In a real application, table creation is typically handled by a migration tool

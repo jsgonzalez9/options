@@ -1,3 +1,6 @@
 requests
 scipy
 SQLAlchemy
+fastapi
+uvicorn[standard]
+httpx # Required for FastAPI TestClient
