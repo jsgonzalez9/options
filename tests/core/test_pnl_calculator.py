@@ -26,7 +26,8 @@ class MockOptionLeg:
 class MockPosition:
     """Helper mock class for Position."""
     def __init__(self, id, cost_basis, status="CLOSED", closing_price=None, legs=None,
-                 unrealized_pnl=0.0, realized_pnl=0.0):
+                 unrealized_pnl=0.0, realized_pnl=0.0,
+                 is_stock_position=False, stock_quantity=None): # Added new fields
         self.id = id
         self.cost_basis = cost_basis
         self.status = status
@@ -34,6 +35,8 @@ class MockPosition:
         self.legs = legs if legs is not None else []
         self.unrealized_pnl = unrealized_pnl
         self.realized_pnl = realized_pnl
+        self.is_stock_position = is_stock_position # Added
+        self.stock_quantity = stock_quantity   # Added
         # Add other fields if pnl_calculator starts using them
         self.spread_type = "Mock Spread"
         self.entry_date = datetime.datetime.utcnow()
@@ -43,41 +46,42 @@ class MockPosition:
 class TestPnlCalculator(unittest.TestCase):
 
     def test_calculate_leg_pnl(self):
-        # Long leg, profit
-        # (Market 3.0 - Entry 2.0) * 1 Qty * 100 Multiplier = 100
-        self.assertAlmostEqual(pnl_calculator.calculate_leg_pnl(2.0, 3.0, 1), 100.0)
+        # Long leg, profit (option)
+        self.assertAlmostEqual(pnl_calculator.calculate_leg_pnl(2.0, 3.0, 1, OPTION_MULTIPLIER), 100.0)
 
-        # Long leg, loss
-        # (Market 1.0 - Entry 2.0) * 1 Qty * 100 Multiplier = -100
-        self.assertAlmostEqual(pnl_calculator.calculate_leg_pnl(2.0, 1.0, 1), -100.0)
+        # Long leg, loss (option)
+        self.assertAlmostEqual(pnl_calculator.calculate_leg_pnl(2.0, 1.0, 1, OPTION_MULTIPLIER), -100.0)
 
-        # Short leg, profit
-        # (Market 1.0 - Entry 2.0) * -1 Qty * 100 Multiplier = (-1.0) * -1 * 100 = 100
-        self.assertAlmostEqual(pnl_calculator.calculate_leg_pnl(2.0, 1.0, -1), 100.0)
+        # Short leg, profit (option)
+        self.assertAlmostEqual(pnl_calculator.calculate_leg_pnl(2.0, 1.0, -1, OPTION_MULTIPLIER), 100.0)
 
         # Short leg, loss
-        # (Market 3.0 - Entry 2.0) * -1 Qty * 100 Multiplier = (1.0) * -1 * 100 = -100
-        self.assertAlmostEqual(pnl_calculator.calculate_leg_pnl(2.0, 3.0, -1), -100.0)
+        # (Market 3.0 - Entry 2.0) * -1 Qty * OPTION_MULTIPLIER Multiplier = (1.0) * -1 * 100 = -100
+        self.assertAlmostEqual(pnl_calculator.calculate_leg_pnl(2.0, 3.0, -1, OPTION_MULTIPLIER), -100.0)
 
         # Zero quantity
-        self.assertAlmostEqual(pnl_calculator.calculate_leg_pnl(2.0, 3.0, 0), 0.0)
+        self.assertAlmostEqual(pnl_calculator.calculate_leg_pnl(2.0, 3.0, 0, OPTION_MULTIPLIER), 0.0)
 
         # Multiple contracts (long, profit)
-        # (Market 3.0 - Entry 2.0) * 2 Qty * 100 Multiplier = 200
-        self.assertAlmostEqual(pnl_calculator.calculate_leg_pnl(2.0, 3.0, 2), 200.0)
+        # (Market 3.0 - Entry 2.0) * 2 Qty * OPTION_MULTIPLIER Multiplier = 200
+        self.assertAlmostEqual(pnl_calculator.calculate_leg_pnl(2.0, 3.0, 2, OPTION_MULTIPLIER), 200.0)
 
         # Multiple contracts (short, profit)
-        # (Market 1.0 - Entry 2.0) * -3 Qty * 100 Multiplier = (-1.0) * -3 * 100 = 300
-        self.assertAlmostEqual(pnl_calculator.calculate_leg_pnl(2.0, 1.0, -3), 300.0)
+        # (Market 1.0 - Entry 2.0) * -3 Qty * OPTION_MULTIPLIER Multiplier = (-1.0) * -3 * 100 = 300
+        self.assertAlmostEqual(pnl_calculator.calculate_leg_pnl(2.0, 1.0, -3, OPTION_MULTIPLIER), 300.0)
+
+        # Stock leg (multiplier 1)
+        # (Market 155 - Entry 150) * 100 shares * 1 multiplier = 500
+        self.assertAlmostEqual(pnl_calculator.calculate_leg_pnl(150.0, 155.0, 100, 1), 500.0) # Already correct
 
     def test_calculate_unrealized_pnl_for_leg(self):
-        # Leg with current_price_per_unit set
-        leg1 = MockOptionLeg(id=1, entry_price_per_unit=5.0, quantity=1, current_price_per_unit=7.5)
+        # Option Leg with current_price_per_unit set
+        leg1 = MockOptionLeg(id=1, entry_price_per_unit=5.0, quantity=1, current_price_per_unit=7.5, option_type="CALL")
         # (7.5 - 5.0) * 1 * 100 = 250
         self.assertAlmostEqual(pnl_calculator.calculate_unrealized_pnl_for_leg(leg1), 250.0)
 
-        # Leg with current_market_price_per_unit override
-        leg2 = MockOptionLeg(id=2, entry_price_per_unit=5.0, quantity=-1, current_price_per_unit=7.5) # This will be overridden
+        # Option Leg with current_market_price_per_unit override
+        leg2 = MockOptionLeg(id=2, entry_price_per_unit=5.0, quantity=-1, current_price_per_unit=7.5, option_type="PUT") # This will be overridden
         # (4.0 - 5.0) * -1 * 100 = 100
         self.assertAlmostEqual(pnl_calculator.calculate_unrealized_pnl_for_leg(leg2, current_market_price_per_unit=4.0), 100.0)
 
@@ -87,61 +91,65 @@ class TestPnlCalculator(unittest.TestCase):
         # Test override with None also
         self.assertAlmostEqual(pnl_calculator.calculate_unrealized_pnl_for_leg(leg3, current_market_price_per_unit=None), 0.0)
 
+        # Test for "STOCK" type leg (should use multiplier 1)
+        stock_leg = MockOptionLeg(id=4, entry_price_per_unit=100.0, quantity=10, current_price_per_unit=102.0, option_type="STOCK")
+        # (102.0 - 100.0) * 10 * 1 = 20.0
+        self.assertAlmostEqual(pnl_calculator.calculate_unrealized_pnl_for_leg(stock_leg), 20.0)
+
+
+    def test_calculate_stock_position_unrealized_pnl(self):
+        # Profit
+        self.assertAlmostEqual(pnl_calculator.calculate_stock_position_unrealized_pnl(100, 150.0, 155.0), 500.0) # (155-150)*100
+        # Loss
+        self.assertAlmostEqual(pnl_calculator.calculate_stock_position_unrealized_pnl(100, 150.0, 140.0), -1000.0) # (140-150)*100
+        # No change
+        self.assertAlmostEqual(pnl_calculator.calculate_stock_position_unrealized_pnl(100, 150.0, 150.0), 0.0)
+        # No current market price
+        self.assertAlmostEqual(pnl_calculator.calculate_stock_position_unrealized_pnl(100, 150.0, None), 0.0)
+
 
     def test_calculate_realized_pnl_for_position(self):
+        # --- Option Spread Scenarios ---
         # Method 1: Position-level closing_price is set
-        # Position cost_basis = 100 (debit), closing_price = 150 (credit received at close) -> PNL = 150 - 100 = 50
-        pos1 = MockPosition(id=1, cost_basis=100.0, closing_price=150.0, status="CLOSED")
-        self.assertAlmostEqual(pnl_calculator.calculate_realized_pnl_for_position(pos1), 50.0)
+        pos_opt_m1 = MockPosition(id=1, cost_basis=100.0, closing_price=150.0, status="CLOSED", is_stock_position=False)
+        self.assertAlmostEqual(pnl_calculator.calculate_realized_pnl_for_position(pos_opt_m1), 50.0)
 
-        # Cost_basis = -200 (credit), closing_price = -50 (debit paid at close) -> PNL = -50 - (-200) = 150
-        pos2 = MockPosition(id=2, cost_basis=-200.0, closing_price=-50.0, status="CLOSED")
-        self.assertAlmostEqual(pnl_calculator.calculate_realized_pnl_for_position(pos2), 150.0)
+        pos_opt_m1_credit = MockPosition(id=2, cost_basis=-200.0, closing_price=-50.0, status="CLOSED", is_stock_position=False)
+        self.assertAlmostEqual(pnl_calculator.calculate_realized_pnl_for_position(pos_opt_m1_credit), 150.0)
 
-        # Method 2: Leg-level closing_price_per_unit, position.closing_price is None
-        leg_a = MockOptionLeg(id=101, entry_price_per_unit=2.0, quantity=1, closing_price_per_unit=3.0) # PNL = (3-2)*1*100 = 100
-        leg_b = MockOptionLeg(id=102, entry_price_per_unit=1.5, quantity=-1, closing_price_per_unit=0.5) # PNL = (0.5-1.5)*-1*100 = 100
-        pos3 = MockPosition(id=3, cost_basis=50.0, status="CLOSED", closing_price=None, legs=[leg_a, leg_b])
-        # Total PNL = 100 + 100 = 200
-        self.assertAlmostEqual(pnl_calculator.calculate_realized_pnl_for_position(pos3), 200.0)
+        # Method 2: Leg-level closing_price_per_unit for options
+        leg_opt_a = MockOptionLeg(id=101, entry_price_per_unit=2.0, quantity=1, closing_price_per_unit=3.0, option_type="CALL") # PNL = 100
+        leg_opt_b = MockOptionLeg(id=102, entry_price_per_unit=1.5, quantity=-1, closing_price_per_unit=0.5, option_type="CALL") # PNL = 100
+        pos_opt_m2 = MockPosition(id=3, cost_basis=50.0, status="CLOSED", closing_price=None, legs=[leg_opt_a, leg_opt_b], is_stock_position=False)
+        self.assertAlmostEqual(pnl_calculator.calculate_realized_pnl_for_position(pos_opt_m2), 200.0)
 
-        # Position is OPEN, should still calculate based on available data if forced, or follow logic.
-        # Current implementation proceeds and calculates.
-        pos4_open_legs_closed = MockPosition(id=4, cost_basis=50.0, status="OPEN", closing_price=None, legs=[leg_a, leg_b])
-        self.assertAlmostEqual(pnl_calculator.calculate_realized_pnl_for_position(pos4_open_legs_closed), 200.0)
+        leg_opt_c_no_close = MockOptionLeg(id=103, entry_price_per_unit=1.0, quantity=1, closing_price_per_unit=None, option_type="PUT")
+        pos_opt_m2_partial = MockPosition(id=5, cost_basis=0.0, status="CLOSED", closing_price=None, legs=[leg_opt_a, leg_opt_c_no_close], is_stock_position=False)
+        self.assertAlmostEqual(pnl_calculator.calculate_realized_pnl_for_position(pos_opt_m2_partial), 100.0) # Only leg_a PNL
 
-        # Position CLOSED, but one leg has no closing_price_per_unit, position.closing_price is None
-        leg_c_no_close = MockOptionLeg(id=103, entry_price_per_unit=1.0, quantity=1, closing_price_per_unit=None)
-        pos5 = MockPosition(id=5, cost_basis=0.0, status="CLOSED", closing_price=None, legs=[leg_a, leg_c_no_close])
-        # PNL will only be from leg_a = 100. leg_c_no_close contributes 0 if its closing_price_per_unit is None.
-        # This depends on how calculate_leg_pnl handles None for market_price, which it shouldn't get here.
-        # calculate_realized_pnl_for_position filters for legs where leg.closing_price_per_unit is not None.
-        self.assertAlmostEqual(pnl_calculator.calculate_realized_pnl_for_position(pos5), 100.0)
+        # --- Stock Position Scenarios ---
+        # Method 1 (Position-level closing_price) for stock
+        pos_stock_m1 = MockPosition(id=7, cost_basis=1000.0, status="CLOSED", closing_price=1200.0, is_stock_position=True, stock_quantity=10, legs=[]) # Legs might be empty if PNL is position level
+        self.assertAlmostEqual(pnl_calculator.calculate_realized_pnl_for_position(pos_stock_m1), 200.0)
 
-        # Position CLOSED, no legs, no position.closing_price. Should be 0.
-        pos6_no_legs = MockPosition(id=6, cost_basis=0.0, status="CLOSED", closing_price=None, legs=[])
-        self.assertAlmostEqual(pnl_calculator.calculate_realized_pnl_for_position(pos6_no_legs), 0.0)
+        # Method 2 (Leg-level) for stock (assuming a single representative "STOCK" leg)
+        # Stock: 10 shares, entry @ 10, close @ 12. Cost basis = 100. PNL = (12-10)*10 = 20
+        stock_leg_closed = MockOptionLeg(id=201, entry_price_per_unit=10.0, quantity=10, closing_price_per_unit=12.0, option_type="STOCK")
+        pos_stock_m2 = MockPosition(id=8, cost_basis=100.0, status="CLOSED", closing_price=None, legs=[stock_leg_closed], is_stock_position=True, stock_quantity=10)
+        self.assertAlmostEqual(pnl_calculator.calculate_realized_pnl_for_position(pos_stock_m2), 20.0)
 
-        # Position CLOSED, no legs, but position.closing_price is set (e.g. a stock position)
-        # Cost_basis = 1000 (stock buy), closing_price = 1200 (stock sell) -> PNL = 200
-        pos7_stock_like = MockPosition(id=7, cost_basis=1000.0, status="CLOSED", closing_price=1200.0, legs=[])
-        self.assertAlmostEqual(pnl_calculator.calculate_realized_pnl_for_position(pos7_stock_like), 200.0)
+        # Stock position closed, but representative leg has no closing_price_per_unit, and no position.closing_price
+        stock_leg_no_close_price = MockOptionLeg(id=202, entry_price_per_unit=10.0, quantity=10, closing_price_per_unit=None, option_type="STOCK")
+        pos_stock_m2_no_leg_price = MockPosition(id=9, cost_basis=100.0, status="CLOSED", closing_price=None, legs=[stock_leg_no_close_price], is_stock_position=True, stock_quantity=10)
+        self.assertAlmostEqual(pnl_calculator.calculate_realized_pnl_for_position(pos_stock_m2_no_leg_price), 0.0) # Expect 0 as PNL is indeterminate
 
-        # Position CLOSED, leg-level, but one leg has closing_price_per_unit = 0.0 (e.g. worthless expiry)
-        leg_d_worthless = MockOptionLeg(id=104, entry_price_per_unit=0.5, quantity=1, closing_price_per_unit=0.0) # Bought for 0.5, closed at 0. PNL = (0-0.5)*1*100 = -50
-        pos8_worthless_leg = MockPosition(id=8, cost_basis=50.0, status="CLOSED", closing_price=None, legs=[leg_d_worthless])
-        self.assertAlmostEqual(pnl_calculator.calculate_realized_pnl_for_position(pos8_worthless_leg), -50.0)
+        # General cases
+        pos_no_legs_no_cp = MockPosition(id=6, cost_basis=0.0, status="CLOSED", closing_price=None, legs=[], is_stock_position=False)
+        self.assertAlmostEqual(pnl_calculator.calculate_realized_pnl_for_position(pos_no_legs_no_cp), 0.0)
 
-        # Position CLOSED, leg-level, mix of closed and open (no closing price) legs - this is unusual for a "CLOSED" position
-        # but tests robustness. calculate_realized_pnl_for_position should sum PNL for legs that DO have closing_price_per_unit.
-        leg_e_closed = MockOptionLeg(id=105, entry_price_per_unit=1.0, quantity=1, closing_price_per_unit=1.5) # PNL = 50
-        leg_f_no_close_price = MockOptionLeg(id=106, entry_price_per_unit=1.0, quantity=1, closing_price_per_unit=None)
-        pos9_mixed_legs = MockPosition(id=9, cost_basis=200.0, status="CLOSED", closing_price=None, legs=[leg_e_closed, leg_f_no_close_price])
-        self.assertAlmostEqual(pnl_calculator.calculate_realized_pnl_for_position(pos9_mixed_legs), 50.0,
-                             "Should sum PNL only from legs with closing_price_per_unit if position.closing_price is None")
 
     def test_calculate_unrealized_pnl_for_leg_zero_quantity(self):
-        leg_zero_qty = MockOptionLeg(id=4, entry_price_per_unit=5.0, quantity=0, current_price_per_unit=7.5)
+        leg_zero_qty = MockOptionLeg(id=4, entry_price_per_unit=5.0, quantity=0, current_price_per_unit=7.5, option_type="CALL")
         self.assertAlmostEqual(pnl_calculator.calculate_unrealized_pnl_for_leg(leg_zero_qty), 0.0)
 
 

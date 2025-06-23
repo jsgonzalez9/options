@@ -5,6 +5,7 @@ from sqlalchemy.orm import sessionmaker, Session
 from src.main import app # Main FastAPI application
 from src.database import models, setup as db_setup
 from src.core import portfolio_manager # To help setup initial cash
+import datetime # Import datetime
 
 class TestPortfolioAPI(unittest.TestCase):
 
@@ -169,6 +170,59 @@ class TestPortfolioAPI(unittest.TestCase):
         # 1. Creating a position via the /positions API.
         # 2. Updating its leg current prices via the /positions/{id}/leg_prices API.
         # 3. Then calling /portfolio/summary and verifying all fields.
+
+        # Create a stock position
+        stock_payload = {
+            "underlying_symbol": "STK1", "spread_type": "Stock", "is_stock_position": True,
+            "stock_quantity": 100, "status": "OPEN",
+            "legs_data": [{"option_type": "STOCK", "strike_price": 0, "expiry_date": datetime.date.today().isoformat(), "quantity": 100, "entry_price_per_unit": 50.0}]
+        }
+        stock_pos_resp = self.client.post("/api/v1/positions/", json=stock_payload)
+        self.assertEqual(stock_pos_resp.status_code, 201)
+        stock_pos_id = stock_pos_resp.json()["id"]
+        stock_pos_leg_id = stock_pos_resp.json()["legs"][0]["id"]
+
+        # Update its current price
+        self.client.post(f"/api/v1/positions/{stock_pos_id}/leg_prices", json={"leg_current_prices": {str(stock_pos_leg_id): 55.0}})
+        # Stock Market Value = 55.0 * 100 = 5500
+
+        # Create an option position
+        option_payload = {
+            "underlying_symbol": "OPT1", "spread_type": "Bull Call Spread", "is_stock_position": False,
+            "status": "OPEN",
+            "legs_data": [
+                {"option_type": "CALL", "strike_price": 100.0, "expiry_date": (datetime.date.today() + datetime.timedelta(days=30)).isoformat(), "quantity": 1, "entry_price_per_unit": 2.00},
+                {"option_type": "CALL", "strike_price": 105.0, "expiry_date": (datetime.date.today() + datetime.timedelta(days=30)).isoformat(), "quantity": -1, "entry_price_per_unit": 1.00}
+            ]
+        }
+        option_pos_resp = self.client.post("/api/v1/positions/", json=option_payload)
+        self.assertEqual(option_pos_resp.status_code, 201)
+        option_pos_id = option_pos_resp.json()["id"]
+        leg1_id = option_pos_resp.json()["legs"][0]["id"]
+        leg2_id = option_pos_resp.json()["legs"][1]["id"]
+
+        # Update its leg prices
+        self.client.post(f"/api/v1/positions/{option_pos_id}/leg_prices", json={"leg_current_prices": {str(leg1_id): 2.20, str(leg2_id): 1.10}})
+        # Option Market Value = (2.20 * 1 * 100) + (1.10 * -1 * 100) = 220 - 110 = 110
+
+        # Total Open Positions Market Value = 5500 (stock) + 110 (option) = 5610
+
+        # Get summary again
+        response_final = self.client.get("/api/v1/portfolio/summary")
+        self.assertEqual(response_final.status_code, 200)
+        data_final = response_final.json()
+
+        self.assertEqual(data_final["cash_balance"], cash_deposit)
+        self.assertAlmostEqual(data_final["total_open_positions_market_value"], 5610.0)
+        self.assertAlmostEqual(data_final["total_portfolio_value"], cash_deposit + 5610.0)
+
+        # P&L calculation:
+        # Stock: Entry 50, Current 55, Qty 100. UPL = (55-50)*100 = 500
+        # Option: Leg1 Entry 2.0, Current 2.2. UPL1 = (2.2-2.0)*1*100 = 20
+        #         Leg2 Entry 1.0, Current 1.1. UPL2 = (1.1-1.0)*-1*100 = -10 (loss for short call as price rose)
+        # Option UPL = 20 - 10 = 10
+        # Total UPL = 500 + 10 = 510. Since no closed positions, Overall PNL = Total UPL.
+        self.assertAlmostEqual(data_final["overall_portfolio_pnl"], 510.0)
 
 
 if __name__ == '__main__':
