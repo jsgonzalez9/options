@@ -1,3 +1,4 @@
+import sqlalchemy # Import sqlalchemy
 from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, Date, Text, ForeignKey
 from sqlalchemy.orm import relationship, sessionmaker, declarative_base
 from sqlalchemy.ext.declarative import declarative_base
@@ -9,10 +10,14 @@ class Position(Base):
     __tablename__ = "positions"
 
     id = Column(Integer, primary_key=True, index=True)
-    underlying_symbol = Column(String, nullable=True, index=True) # NEW FIELD
-    spread_type = Column(String, index=True, nullable=False) # Already indexed
-    entry_date = Column(DateTime, default=datetime.datetime.utcnow, index=True) # Add index
-    status = Column(String, default="OPEN", index=True) # Already indexed
+    underlying_symbol = Column(String, nullable=True, index=True)
+    spread_type = Column(String, index=True, nullable=False)
+    entry_date = Column(DateTime, default=datetime.datetime.utcnow, index=True)
+    status = Column(String, default="OPEN", index=True)
+
+    # Fields for stock positions
+    is_stock_position = Column(sqlalchemy.Boolean, default=False, nullable=False) # Corrected to sqlalchemy.Boolean
+    stock_quantity = Column(Integer, nullable=True) # Number of shares for a stock position
     # cost_basis is the net cost to open the position. Positive if debit, negative if credit.
     cost_basis = Column(Float, nullable=False, default=0.0)
     closing_price = Column(Float, nullable=True) # Net price when position is closed

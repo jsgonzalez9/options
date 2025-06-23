@@ -1,15 +1,14 @@
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, File
 from sqlalchemy.orm import Session
-from typing import List, Optional
+from typing import List, Optional, Dict, Any # Added Any
 import datetime
 
 from src.database import setup as db_setup, crud, models
 from src.api_schemas import (
-    PositionCreate, PositionDisplay, OptionLegDisplay, PositionBase, # PositionBase for notes before
-    LegPricesUpdate, PositionDetailDisplay, NotesUpdate # Added NotesUpdate
+    PositionCreate, PositionDisplay, OptionLegDisplay, PositionBase,
+    LegPricesUpdate, PositionDetailDisplay, NotesUpdate
 )
-# PositionDeltaParams might be used by a dedicated delta endpoint later or if params are complex for GET
-from src.core import derivatives_calculator
+from src.core import derivatives_calculator, csv_importer
 from src.api.alpha_vantage import AlphaVantageAPI
 
 router = APIRouter(
@@ -26,21 +25,9 @@ def _prepare_position_display(db_position: models.Position, calculated_delta: Op
     """Helper to convert ORM Position to Pydantic PositionDetailDisplay including DTE and delta."""
 
     display_legs = []
-    if db_position.legs: # Ensure legs relationship is loaded and not None
+    if db_position.legs:
         for leg_orm in db_position.legs:
-            # Manually create a dict from the ORM object's attributes
-            leg_data = {
-                "id": leg_orm.id,
-                "position_id": leg_orm.position_id,
-                "option_type": leg_orm.option_type,
-                "strike_price": leg_orm.strike_price,
-                "expiry_date": leg_orm.expiry_date,
-                "quantity": leg_orm.quantity,
-                "entry_price_per_unit": leg_orm.entry_price_per_unit,
-                "current_price_per_unit": leg_orm.current_price_per_unit,
-                "closing_price_per_unit": leg_orm.closing_price_per_unit,
-                "entry_date_leg": leg_orm.entry_date_leg,
-            }
+            leg_data = {column.name: getattr(leg_orm, column.name) for column in leg_orm.__table__.columns}
             display_legs.append(OptionLegDisplay(**leg_data))
 
     dte = None
@@ -65,33 +52,30 @@ def _prepare_position_display(db_position: models.Position, calculated_delta: Op
 @router.post("/", response_model=PositionDetailDisplay, status_code=201)
 def create_new_position(position_in: PositionCreate, db: Session = Depends(db_setup.get_db_session)):
     try:
-        # Use mode='python' to keep datetime.date objects as is from Pydantic model, not strings
         legs_data_dicts = [leg.model_dump(mode='python') for leg in position_in.legs_data]
 
         created_position = crud.create_position(
             db=db,
-            underlying_symbol=position_in.underlying_symbol, # Pass underlying_symbol
+            underlying_symbol=position_in.underlying_symbol,
             spread_type=position_in.spread_type,
             legs_data=legs_data_dicts,
             status=position_in.status,
-            notes=position_in.notes
+            notes=position_in.notes,
+            is_stock_position=position_in.is_stock_position, # Pass new fields
+            stock_quantity=position_in.stock_quantity      # Pass new fields
         )
         db.commit()
-        # Refresh is crucial to get DB-generated IDs and relationships correctly loaded
         db.refresh(created_position)
-        # Eager load/refresh legs after commit if they are not automatically loaded/updated by the main refresh
-        # This ensures that _prepare_position_display gets the full leg data
-        if created_position.legs: # Accessing .legs might trigger a load if not already loaded
+        if created_position.legs:
              for leg in created_position.legs:
-                 db.refresh(leg) # Ensure each leg's data is fresh from DB
+                 db.refresh(leg)
 
         return _prepare_position_display(created_position)
-    except ValueError as ve: # Catch validation errors from CRUD or spread_validator
+    except ValueError as ve:
         db.rollback()
         raise HTTPException(status_code=400, detail=str(ve))
     except Exception as e:
         db.rollback()
-        # import traceback; traceback.print_exc(); # For server-side debugging
         raise HTTPException(status_code=500, detail=f"An unexpected error occurred during position creation: {e}")
 
 
@@ -102,7 +86,6 @@ def list_all_positions(
     db: Session = Depends(db_setup.get_db_session)
 ):
     db_positions = crud.get_all_positions(db, status=status, skip=skip, limit=limit)
-    # _prepare_position_display expects legs to be loaded. get_all_positions uses joinedload.
     return [_prepare_position_display(pos) for pos in db_positions]
 
 
@@ -114,12 +97,12 @@ def get_specific_position(
     volatility: Optional[float] = Query(None, description="Override volatility for delta (e.g., 0.20)"),
     risk_free_rate: Optional[float] = Query(None, description="Override risk-free rate for delta (e.g., 0.05)")
 ):
-    db_position = crud.get_position_by_id(db, position_id) # This uses joinedload for legs
+    db_position = crud.get_position_by_id(db, position_id)
     if not db_position:
         raise HTTPException(status_code=404, detail="Position not found")
 
     position_delta = None
-    if db_position.status == "OPEN":
+    if db_position.status == "OPEN" and not db_position.is_stock_position : # Delta for options, not simple stocks
         try:
             position_delta = derivatives_calculator.calculate_position_delta(
                 db=db, position=db_position, price_fetcher=price_fetcher,
@@ -127,7 +110,6 @@ def get_specific_position(
             )
         except Exception as delta_error:
             print(f"Warning: Could not calculate delta for position {position_id}: {delta_error}")
-            # position_delta remains None
 
     return _prepare_position_display(db_position, calculated_delta=position_delta)
 
@@ -150,11 +132,10 @@ def update_position_status_endpoint(
 
 @router.post("/{position_id}/notes", response_model=PositionDetailDisplay)
 def update_position_notes(
-    position_id: int, notes_in: NotesUpdate, # Use new NotesUpdate schema
+    position_id: int, notes_in: NotesUpdate,
     append: bool = Query(True, description="False to overwrite, True to append."),
     db: Session = Depends(db_setup.get_db_session)
 ):
-    # notes_in.notes will be validated by Pydantic to be a string
     updated_pos = crud.add_note_to_position(db, position_id, notes_in.notes, append=append)
     if not updated_pos:
         raise HTTPException(status_code=404, detail="Position not found")
@@ -181,3 +162,56 @@ def update_leg_prices_and_upl_endpoint(
         for leg in updated_pos.legs: db.refresh(leg)
 
     return _prepare_position_display(updated_pos)
+
+@router.post("/import_csv_stock", summary="Import Stock Positions from CSV", response_model=Dict[str, Any])
+async def import_stock_positions_csv(
+    file: UploadFile = File(..., description="CSV file containing stock positions."),
+    db: Session = Depends(db_setup.get_db_session)
+):
+    """
+    Imports stock positions from an uploaded CSV file.
+
+    Expected CSV Columns:
+    - `underlying_symbol` (string)
+    - `stock_quantity` (integer)
+    - `entry_price_per_unit` (float)
+    - `entry_date` (string, "YYYY-MM-DD" or "YYYY-MM-DD HH:MM:SS")
+    - `notes` (string, optional)
+    """
+    if not file.filename.endswith('.csv'):
+        raise HTTPException(status_code=400, detail="Invalid file type. Please upload a CSV file.")
+
+    try:
+        contents = await file.read()
+
+        import_results = csv_importer.import_stock_positions_from_csv(db, contents)
+
+        if import_results["success_count"] > 0:
+            db.commit()
+        else:
+            # If there were errors but also some successes that were part of a larger transaction
+            # handled by the importer, this rollback might undo them.
+            # The importer should ideally handle transactions per row or signal overall success/failure.
+            # For now, if importer indicates any success, we commit. Otherwise, rollback.
+            # This assumes import_stock_positions_from_csv doesn't do its own commits.
+            if not import_results["errors"] or import_results["failure_count"] == 0 : # if no errors, or only successes
+                 db.commit() # Should be redundant if success_count > 0 already committed.
+            else:
+                 db.rollback()
+
+
+        return {
+            "message": "CSV processing complete.",
+            "filename": file.filename,
+            "successful_imports": import_results["success_count"],
+            "failed_imports": import_results["failure_count"],
+            "errors": import_results["errors"]
+        }
+    except HTTPException:
+        db.rollback() # Rollback on known HTTP exceptions if they occur before commit point
+        raise
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"An error occurred during CSV processing: {str(e)}")
+    finally:
+        await file.close()

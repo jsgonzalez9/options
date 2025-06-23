@@ -1,20 +1,25 @@
 from src.api.alpha_vantage import AlphaVantageAPI
+from src.api.live_price_client import LivePriceClient # Import the new client
 from src.financial_models import black_scholes
 import datetime
+from typing import Optional # For type hinting
 
 class PriceFetcher:
-    def __init__(self, api_key: str = None):
+    def __init__(self, alpha_vantage_api_key: Optional[str] = None, use_live_client: bool = True):
         """
         Initializes the PriceFetcher.
 
         Args:
-            api_key: Optional Alpha Vantage API key. If None, AlphaVantageAPI will use its default.
+            alpha_vantage_api_key: Optional Alpha Vantage API key.
+            use_live_client: If True, attempts to use LivePriceClient (e.g., yfinance) first.
         """
-        self.api_client = AlphaVantageAPI(api_key=api_key if api_key else "SS1101G6BC9AHU38") # Ensure API key is passed
+        self.av_client = AlphaVantageAPI(api_key=alpha_vantage_api_key if alpha_vantage_api_key else "SS1101G6BC9AHU38")
+        self.live_client = LivePriceClient() if use_live_client else None
 
-    def get_live_stock_price(self, symbol: str) -> float | None:
+    def get_live_stock_price(self, symbol: str) -> Optional[float]:
         """
         Fetches the live price of a stock.
+        Tries LivePriceClient first (if enabled), then falls back to AlphaVantageAPI.
 
         Args:
             symbol: The stock symbol (e.g., "AAPL").
@@ -22,16 +27,31 @@ class PriceFetcher:
         Returns:
             The current price as a float, or None if an error occurs or price isn't found.
         """
+        price = None
+        # Try LivePriceClient first
+        if self.live_client:
+            try:
+                price = self.live_client.get_current_price(symbol)
+                if price is not None:
+                    # print(f"Fetched price for {symbol} using LivePriceClient: {price}")
+                    return float(price)
+            except Exception as e:
+                print(f"Error fetching stock price for {symbol} with LivePriceClient: {e}. Trying AlphaVantage.")
+
+        # Fallback to AlphaVantageAPI
         try:
-            quote = self.api_client.get_stock_quote(symbol)
+            # print(f"Fetching price for {symbol} using AlphaVantageAPI...")
+            quote = self.av_client.get_stock_quote(symbol)
             price_str = quote.get("05. price")
             if price_str:
-                return float(price_str)
+                price = float(price_str)
+                # print(f"Fetched price for {symbol} using AlphaVantageAPI: {price}")
+                return price
             else:
-                print(f"Could not find price for {symbol} in quote: {quote}")
+                print(f"Could not find price for {symbol} in AlphaVantage quote: {quote}")
                 return None
         except Exception as e:
-            print(f"Error fetching stock price for {symbol}: {e}")
+            print(f"Error fetching stock price for {symbol} with AlphaVantageAPI: {e}")
             return None
 
     def calculate_option_greeks_custom(self,

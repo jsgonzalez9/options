@@ -65,11 +65,33 @@ class TestPositionsAPI(unittest.TestCase):
     def _create_bull_call_spread_payload(self, underlying_symbol="TESTXYZ", spread_type_override=None) -> dict:
         return {
             "underlying_symbol": underlying_symbol,
-            "spread_type": spread_type_override if spread_type_override else "Bull Call Spread", # Use specific type
+            "spread_type": spread_type_override if spread_type_override else "Bull Call Spread",
+            "is_stock_position": False, # Explicitly options
+            "stock_quantity": None,
             "status": "OPEN",
             "legs_data": [
                 {"option_type": "CALL", "strike_price": 100.0, "expiry_date": (datetime.date.today() + datetime.timedelta(days=30)).isoformat(), "quantity": 1, "entry_price_per_unit": 2.00},
                 {"option_type": "CALL", "strike_price": 105.0, "expiry_date": (datetime.date.today() + datetime.timedelta(days=30)).isoformat(), "quantity": -1, "entry_price_per_unit": 1.00}
+            ]
+        }
+
+    def _create_stock_payload(self, underlying_symbol="STOCKXYZ", quantity=100, entry_price=50.0, status="OPEN") -> dict:
+        entry_date_str = (datetime.date.today() - datetime.timedelta(days=10)).isoformat()
+        return {
+            "underlying_symbol": underlying_symbol,
+            "spread_type": "Stock",
+            "is_stock_position": True,
+            "stock_quantity": quantity,
+            "status": status,
+            "notes": f"Stock position for {underlying_symbol}",
+            "legs_data": [
+                {
+                    "option_type": "STOCK",
+                    "strike_price": 0,
+                    "expiry_date": entry_date_str,
+                    "quantity": quantity,
+                    "entry_price_per_unit": entry_price
+                }
             ]
         }
 
@@ -144,9 +166,24 @@ class TestPositionsAPI(unittest.TestCase):
         self.assertIsNotNone(data["calculated_position_delta"], "Calculated delta should not be None")
         self.assertTrue(abs(data["calculated_position_delta"] - expected_delta) < 0.01,
                         f"Delta {data['calculated_position_delta']:.4f} not close to expected {expected_delta:.4f}")
-
-        # Ensure the mock was called with the correct symbol from the position
         mock_get_quote.assert_called_once_with(test_symbol)
+
+    @patch('src.core.derivatives_calculator.AlphaVantageAPI.get_stock_quote')
+    def test_get_specific_stock_position_no_delta(self, mock_get_quote):
+        # Create a stock position
+        stock_payload = self._create_stock_payload(underlying_symbol="STKDELTA")
+        create_response = self.client.post("/api/v1/positions/", json=stock_payload)
+        self.assertEqual(create_response.status_code, 201, create_response.json())
+        position_id = create_response.json()["id"]
+
+        # Get the stock position
+        response = self.client.get(f"/api/v1/positions/{position_id}")
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertEqual(data["id"], position_id)
+        self.assertTrue(data["is_stock_position"])
+        self.assertIsNone(data["calculated_position_delta"], "Delta should be None for stock positions via this field")
+        mock_get_quote.assert_not_called() # Delta calculation should be skipped
 
 
     def test_update_position_status_to_closed(self):

@@ -6,13 +6,14 @@ from typing import Optional
 # For now, using a global constant consistent with crud.py.
 from src.config import OPTION_MULTIPLIER # Centralized configuration
 
-def calculate_leg_pnl(
+def calculate_leg_pnl( # Renamed OPTION_MULTIPLIER to multiplier
     leg_entry_price: float,
     leg_market_price: float,
-    leg_quantity: int
+    leg_quantity: int,
+    multiplier: int # Added multiplier argument
 ) -> float:
     """
-    Calculates the Profit or Loss for a single option leg based on its market price.
+    Calculates the Profit or Loss for a single leg (option or stock) based on its market price.
 
     Args:
         leg_entry_price: The price per unit at which the leg was entered.
@@ -32,9 +33,9 @@ def calculate_leg_pnl(
     # This can be unified: P&L = (market_price - entry_price) * quantity * multiplier
     # Example Long: quantity=1, entry=2, market=3. PNL = (3-2)*1*100 = 100 (Profit)
     # Example Short: quantity=-1, entry=2, market=1. PNL = (1-2)*-1*100 = (-1)*-1*100 = 100 (Profit)
-    # Example Short: quantity=-1, entry=2, market=3. PNL = (3-2)*-1*100 = 1*-1*100 = -100 (Loss)
+    # Example Short: quantity=-1, entry=2, market=3. PNL = (3-2)*-1*multiplier = 1*-1*multiplier = -multiplier (Loss)
 
-    pnl = price_diff_per_unit * leg_quantity * OPTION_MULTIPLIER
+    pnl = price_diff_per_unit * leg_quantity * multiplier
     return pnl
 
 def calculate_unrealized_pnl_for_leg(
@@ -43,33 +44,41 @@ def calculate_unrealized_pnl_for_leg(
 ) -> float:
     """
     Calculates the unrealized P&L for a single option leg using its current_price_per_unit
-    or a provided market price.
-
-    Args:
-        leg: The OptionLeg object.
-        current_market_price_per_unit: Optional override for the leg's current market price.
-                                       If None, uses leg.current_price_per_unit.
-
-    Returns:
-        The unrealized P&L for the leg.
+    or a provided market price. This is primarily for option legs.
+    For stock positions, use calculate_stock_position_unrealized_pnl.
     """
     market_price = current_market_price_per_unit if current_market_price_per_unit is not None else leg.current_price_per_unit
 
-    if market_price is None: # Cannot calculate P&L if no market price is available
-        # print(f"Warning: Leg {leg.id} has no current_price_per_unit, cannot calculate unrealized P&L.")
+    if market_price is None:
         return 0.0
-        # Or raise an error, or return None, depending on desired handling.
-        # Returning 0.0 means it won't contribute to total P&L if price is missing.
+
+    # Determine multiplier based on leg type (STOCK vs OPTION)
+    # This assumes our "STOCK" type leg has option_type == "STOCK"
+    # and its quantity field stores number of shares.
+    effective_multiplier = 1 if leg.option_type == "STOCK" else OPTION_MULTIPLIER
 
     return calculate_leg_pnl(
         leg_entry_price=leg.entry_price_per_unit,
         leg_market_price=market_price,
-        leg_quantity=leg.quantity
+        leg_quantity=leg.quantity,
+        multiplier=effective_multiplier
     )
+
+def calculate_stock_position_unrealized_pnl(
+    stock_quantity: int,
+    entry_price_per_unit: float, # This would be from the "representative" leg or Position field
+    current_market_price: float
+) -> float:
+    """Calculates unrealized P&L for a simple stock position."""
+    if current_market_price is None:
+        return 0.0
+    return (current_market_price - entry_price_per_unit) * stock_quantity
+
 
 def calculate_realized_pnl_for_position(position: models.Position) -> float:
     """
     Calculates the realized P&L for a closed position.
+    Handles both option spreads and simple stock positions.
 
     Method 1: If position.closing_price is set (net credit/debit for closing entire position).
               This is the total P&L for the position.
@@ -93,44 +102,51 @@ def calculate_realized_pnl_for_position(position: models.Position) -> float:
         # Or return 0.0, or raise error. For now, let it proceed if data is available.
         pass
 
-    # Method 1: Position-level closing price
+    # Method 1: Position-level closing_price is set (suitable for stocks or entire spreads closed for a net value)
     if position.closing_price is not None:
-        # cost_basis: positive for debit, negative for credit.
-        # closing_price: positive for credit received at close, negative for debit paid at close.
-        # Example: Buy stock for $100 (cost_basis=100). Sell for $120 (closing_price=120). PNL = 120 - 100 = 20.
-        # Example: Open spread for $1 credit (cost_basis=-100). Close for $0.5 debit (closing_price=-50). PNL = -50 - (-100) = 50.
+        # cost_basis is total cost (positive for debit, negative for credit)
+        # closing_price is total proceeds (positive for credit, negative for debit)
         return position.closing_price - position.cost_basis
 
-    # Method 2: Leg-level closing prices
-    total_realized_pnl = 0.0
-    all_legs_have_closing_price = True
-    if not position.legs: # No legs, P&L is 0 unless it's a stock position with direct P&L.
-        return 0.0 # Or handle stock positions if they have different P&L fields.
-
-    for leg in position.legs:
+    # Method 2: Leg-level closing prices (primarily for option spreads where legs might be managed individually)
+    # If it's a stock position without a position.closing_price, this path might not be appropriate
+    # unless the stock "leg" has a closing_price_per_unit.
+    if position.is_stock_position and position.legs: # Stock position represented by a single leg
+        leg = position.legs[0] # Assuming one representative leg for stock
         if leg.closing_price_per_unit is not None:
-            total_realized_pnl += calculate_leg_pnl(
+             # For stock, leg.quantity is share count, multiplier is 1.
+            return calculate_leg_pnl(
                 leg_entry_price=leg.entry_price_per_unit,
                 leg_market_price=leg.closing_price_per_unit,
-                leg_quantity=leg.quantity
+                leg_quantity=leg.quantity,
+                multiplier=1
             )
-        else:
-            # If any leg doesn't have a closing price, Method 2 is incomplete.
-            all_legs_have_closing_price = False
-            # print(f"Warning: Leg {leg.id} in closed position {position.id} has no closing_price_per_unit.")
-            # Depending on strictness, could return 0 or raise error.
-            # For now, we sum what we can. If this path is taken, it means position.closing_price was None.
-            # This implies we MUST rely on leg data. If leg data is missing, P&L is partial.
-            pass
+        else: # Stock position closed but leg has no closing price - fallback to position level if possible, else 0
+            # This case implies data might be incomplete for leg-based stock P&L.
+            # If position.closing_price was None, and leg.closing_price_per_unit is None, P&L is indeterminate here.
+            print(f"Warning: Stock Position {position.id} is CLOSED but has no position.closing_price and its leg has no closing_price_per_unit.")
+            return 0.0
 
-    if not all_legs_have_closing_price and position.closing_price is None:
-        # This indicates data inconsistency or a partially closed position where overall P&L isn't yet determined.
-        # print(f"Warning: Position {position.id} is CLOSED, but full P&L cannot be determined from available data.")
-        # Fallback to 0 or previously stored realized_pnl if that makes sense.
-        # For now, return the sum calculated from available leg closing prices.
-        pass
+    elif not position.is_stock_position and position.legs: # Option spread
+        total_realized_pnl = 0.0
+        all_legs_have_closing_price = True
+        for leg in position.legs:
+            if leg.closing_price_per_unit is not None:
+                total_realized_pnl += calculate_leg_pnl(
+                    leg_entry_price=leg.entry_price_per_unit,
+                    leg_market_price=leg.closing_price_per_unit,
+                    leg_quantity=leg.quantity,
+                    multiplier=OPTION_MULTIPLIER # Options use the standard multiplier
+                )
+            else:
+                all_legs_have_closing_price = False
 
-    return total_realized_pnl
+        if not all_legs_have_closing_price:
+            print(f"Warning: Option Position {position.id} is CLOSED, but not all legs have closing_price_per_unit. P&L may be partial.")
+        return total_realized_pnl
+
+    # Default if no other condition met (e.g., no legs, no position.closing_price)
+    return 0.0
 
 
 if __name__ == '__main__':

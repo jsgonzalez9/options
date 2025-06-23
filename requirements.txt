@@ -4,3 +4,5 @@ SQLAlchemy
 fastapi
 uvicorn[standard]
 httpx # Required for FastAPI TestClient
+yfinance
+python-multipart # For FastAPI file uploads

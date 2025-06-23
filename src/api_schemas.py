@@ -5,7 +5,7 @@ import datetime
 # --- OptionLeg Schemas ---
 
 class OptionLegBase(BaseModel):
-    option_type: str = Field(..., pattern="^(CALL|PUT)$") # "CALL" or "PUT"
+    option_type: str = Field(..., pattern="^(CALL|PUT|STOCK)$") # Allow "STOCK"
     strike_price: float
     expiry_date: datetime.date
     quantity: int # Positive for long, negative for short
@@ -28,8 +28,10 @@ class OptionLegDisplay(OptionLegBase):
 # --- Position Schemas ---
 
 class PositionBase(BaseModel):
-    underlying_symbol: Optional[str] = None # NEW FIELD
+    underlying_symbol: Optional[str] = None
     spread_type: str
+    is_stock_position: bool = False # NEW FIELD
+    stock_quantity: Optional[int] = None # NEW FIELD
     status: str = Field(default="OPEN", pattern="^(OPEN|CLOSED|ROLLED|EXPIRED)$")
     notes: Optional[str] = None
     cost_basis: Optional[float] = None
@@ -120,6 +122,33 @@ class PositionDetailDisplay(PositionDisplay):
         if v is not None:
             return round(v, 4)
         return v
+
+# --- CSV Import Schemas ---
+
+class StockPositionCsvRow(BaseModel):
+    underlying_symbol: str = Field(..., min_length=1)
+    stock_quantity: int
+    entry_price_per_unit: float = Field(..., gt=0)
+    entry_date: datetime.datetime # Pydantic will parse common date/datetime string formats
+    notes: Optional[str] = None
+
+    @validator('entry_date', pre=True)
+    def parse_entry_date(cls, value):
+        if isinstance(value, str):
+            try:
+                # Attempt to parse datetime first
+                return datetime.datetime.fromisoformat(value.replace(' ', 'T'))
+            except ValueError:
+                # Fallback to just date if time is not included
+                try:
+                    return datetime.datetime.combine(datetime.date.fromisoformat(value), datetime.time.min)
+                except ValueError:
+                    raise ValueError(f"Invalid date/datetime format for entry_date: '{value}'. Use YYYY-MM-DD or YYYY-MM-DD HH:MM:SS.")
+        elif isinstance(value, datetime.datetime):
+            return value
+        elif isinstance(value, datetime.date): # If already a date object (e.g. from other Pydantic model)
+            return datetime.datetime.combine(value, datetime.time.min)
+        raise TypeError("Invalid type for entry_date")
 
 
 if __name__ == "__main__":

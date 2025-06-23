@@ -63,16 +63,14 @@ def calculate_total_open_positions_market_value(db: Session) -> float:
     total_market_value = 0.0
 
     for position in open_positions:
-        if position.spread_type == "Stock": # Placeholder for future stock handling
-            # For stocks, market value = quantity * current_price_per_unit (no multiplier usually)
-            # This needs a different model or field on Position/Leg for stock quantity/price.
-            # For now, skipping stock positions or assuming they are handled as options if using OptionLeg.
-            pass
+        if position.is_stock_position:
+            if position.stock_quantity is not None and position.legs and position.legs[0].current_price_per_unit is not None:
+                # Assuming the stock's current price is stored in its representative leg's current_price_per_unit
+                # And stock_quantity is on the Position model. Multiplier is 1 for stocks.
+                total_market_value += position.legs[0].current_price_per_unit * position.stock_quantity
         else: # Option Spreads
             for leg in position.legs:
                 if leg.current_price_per_unit is not None:
-                    # Long position (qty > 0): current_price * qty * mult = positive value
-                    # Short position (qty < 0): current_price * qty * mult = negative value (liability)
                     total_market_value += leg.current_price_per_unit * leg.quantity * OPTION_MULTIPLIER
     return total_market_value
 
